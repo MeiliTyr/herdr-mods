@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "updated_ms": 1793405630000,
+  "records": [
+    {
+      "id": "t40@1793405000000",
+      "address": "t40",
+      "parent": "t39",
+      "parent_id": null,
+      "name": null,
+      "agent": "zsh",
+      "command": "pnpm lint",
+      "cwd": "/Users/me/code/example-app",
+      "where": "example-app / 2",
+      "state": "finished",
+      "status": null,
+      "created_ms": 1793405000000,
+      "finished_ms": 1793405095000,
+      "exit_code": 0,
+      "reason": "exited",
+      "removed_ms": null
+    },
+    {
+      "id": "t41@1793405005000",
+      "address": "t41",
+      "parent": "t39",
+      "parent_id": null,
+      "name": null,
+      "agent": "zsh",
+      "command": "pnpm typecheck",
+      "cwd": "/Users/me/code/example-app",
+      "where": "example-app / 2",
+      "state": "finished",
+      "status": null,
+      "created_ms": 1793405005000,
+      "finished_ms": 1793405100000,
+      "exit_code": 0,
+      "reason": "exited",
+      "removed_ms": null
+    },
+    {
+      "id": "vps/t50@1793405030000",
+      "address": "vps/t50",
+      "parent": "vps/t49",
+      "parent_id": null,
+      "name": "deploy-check",
+      "agent": "zsh",
+      "command": "./deploy.sh --dry-run",
+      "cwd": "/Users/me/code/example-app",
+      "where": "vps / ops",
+      "state": "finished",
+      "status": null,
+      "created_ms": 1793405030000,
+      "finished_ms": 1793405125000,
+      "exit_code": 0,
+      "reason": "exited",
+      "removed_ms": null
+    }
+  ]
+}
