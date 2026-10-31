@@ -1,14 +1,29 @@
 // One long-lived graph copy lives in the side panel’s panel-body stack beside Files and Changes.
 // Keeping it alive keeps Herdr’s JIT warm; fresh copies are cold and stall the window for seconds.
 //
-// A snapshot, not a feed: the history file and terminals() are read when the panel opens, when
-// the active space changes while it shows, and on Refresh. Nothing watches the recorder and
-// nothing ticks, so being open costs one render, not one per terminal title change.
+// Live while shown. Every update goes through one coordinator (live.js), one pass at a time:
+// - Terminals: Herdr calls render on every live-data change (title ticks too). A shown render that
+//   is not a pan's compares a string key of the shown tab (space and tab id, name) and its terminals' shown
+//   fields (never titles) with the key the graph was built from, and only a difference asks for a
+//   pass. A pan's render skips it; one check runs off the render path 200 ms after the last pan.
+// - History: one watcher on the history file's folder. The recorder's rename onto the file marks
+//   the history stale (its temp files don't); a shown graph rereads it at once, a hidden one when
+//   it shows. A folder that can't be watched is retried every 5 s, rereading the history while
+//   shown. A failed read or parse keeps the previous records and says so in the bar.
+// - Showing the graph and switching spaces ask for a pass; the history is reread only if stale.
+// - Key commands: "close" hides; anything else rereads everything and redraws.
+// A pass builds the model off the render path, then compares what the view would show: an equal
+// graph keeps the old model and draws nothing; a changed one rebuilds the card slab only if its
+// drawn cards, links or geometry differ, else only the host redraws (and only if its headers or
+// bar changed). Hidden, a pass builds and draws nothing and the work waits for the graph to show.
+// Durations: an unfinished card shows "<1m" for its first minute; once a minute, while shown, the
+// slab redraws only if a drawn card's duration text would change.
 
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { terminals, spaces, panes, theme, run, props, home, readTextFile, nextCommand, shared, exec, notify, appHome, layout as windowLayout } from "herdr";
-import { parseHistory, merge, orderRuns, facts, title, outcome, isDone, duration, clock, layout, colX, rowY, CARD_W, CARD_H, qualify, RESUMABLE, agentOf } from "./model.js";
+import { terminals, spaces, panes, theme, run, props, home, readTextFile, watchFolder, knownAgents, nextCommand, shared, exec, notify, appHome, layout as windowLayout } from "herdr";
+import { parseHistory, merge, orderRuns, facts, title, outcome, isDone, duration, layout, colX, rowY, CARD_W, CARD_H, qualify, RESUMABLE, agentOf } from "./model.js";
+import { Live } from "./live.js";
 
 // Whether layout node `id` is on screen: it and every ancestor not hidden, and every stack on the
 // way showing that branch. null when the layout has no such node.
@@ -26,12 +41,66 @@ function onScreen(node, id) {
 const isShown = () => onScreen(windowLayout(), "graph") ?? true;
 const hide = () => run("layout.hide", { id: "panel" });
 
+// The history file: props().history (absolute as given, relative to this mod's folder), else the
+// recorder's.
+function historyPath(p) {
+  if (!p) return `${home()}/.local/share/herdr-agent-graph/history.json`;
+  return p.startsWith("/") ? p : `${appHome()}/mods/agent-graph/${p.replace(/^\.\//, "")}`;
+}
+
 const GRAPH_W = 900;
 const GRAPH_H = 560;
 const BAR_H = 32;
 const HEAD_H = 34;
 const LINK = 1.5;
 const MAX_CARDS = 28;
+// The slab: cards and links are built for the viewport plus this margin, in a retained child view.
+// A pan inside the slab only moves it, so scrolling builds no cards (see Slab below).
+const SLAB_MX = CARD_W + 60;
+const SLAB_MY = 2 * (CARD_H + 12);
+
+// Graph copies by id, so a Slab (a retained child, given only plain props) finds its host.
+const hosts = new Map();
+let hostSeq = 0;
+
+// The drawn cards and links of the host's current slab. Rebuilt only when the host sets new props
+// (or the theme changes), never when the host re-renders for a pan.
+class Slab extends View {
+  init(props) { this.hostId = props?.host; }
+  update(props) { this.hostId = props?.host; }
+  render() {
+    const host = hosts.get(this.hostId);
+    const s = host?.slab;
+    if (!s) return div();
+    return host.slabElement(theme(), s, Date.now());
+  }
+}
+
+// A card's duration uses now while it has neither a finished nor a removed time (or no start).
+const aging = (f) => (f.finished == null && f.removed == null) || f.created == null;
+// Its text: an aging card says "<1m" for its first minute, so it changes once a minute at most.
+function ageText(f, now) {
+  const ms = (f.finished ?? f.removed ?? now) - (f.created ?? now);
+  return aging(f) && ms >= 0 && ms < 60000 ? "<1m" : duration(ms);
+}
+
+// Everything card() and glyph() draw of a node, except an aging card's duration text.
+function cardKey(n) {
+  const v = n.v;
+  if (v.key) return v.key;
+  if (v.ghost) return (v.key = JSON.stringify([n.id, "ghost", n.address]));
+  const f = v.f;
+  return (v.key = JSON.stringify([n.id, n.address, v.title, v.o.word, v.o.kind, v.loud, v.meta,
+    v.program?.icon ?? null, Boolean(v.program?.tint), f.removed != null, v.peekable, v.resumable,
+    aging(f) ? ["aging", f.created] : ageText(f, 0)]));
+}
+
+// What a slab draws: its geometry, its cards where they are, and its links.
+const slabKey = (s) => JSON.stringify([s.x0, s.y0, s.sw, s.sh, s.hidden, [...s.shownCols].sort((a, b) => a - b),
+  s.drawn.map((d) => [d.x, d.y, cardKey(d.n)]), s.linkGeo]);
+
+// What the bar shows of the coordinator's state (not the space or tab: the window already says).
+const barKey = ({ error, missing, ready }) => JSON.stringify([error, missing, ready]);
 
 const store = {
   get(key, fallback) {
@@ -59,28 +128,26 @@ function liveTerminals() {
       template: t.template ?? null,
       argv: Array.isArray(t.argv) ? t.argv.slice(0, 12).map(String) : null,
       space_label: t.labels?.["herdr.space"] ?? null,
+      tab_label: t.labels?.["herdr.tab"] ?? null,
       program: p ? { name: p.name, icon: p.icon, tint: p.tint, agent: p.agent } : null,
     };
   });
 }
 
-// The id Herdr writes in a terminal's herdr.space label (local to its machine).
-const localSpaceId = (space) => {
-  const id = space?.id ?? "";
-  return id.includes("/") ? id.slice(id.indexOf("/") + 1) : id;
-};
+// The id Herdr writes in a terminal's herdr.space / herdr.tab label (local to its machine).
+const localId = (id) => (id && id.includes("/") ? id.slice(id.indexOf("/") + 1) : id ?? "");
 
-// The part of a record's `where` ("space / tab") that names the space.
+// A record's `where` ("space / tab"): the space part and the tab part.
 const whereSpace = (where) => (where ?? "").split(" / ")[0];
+const whereTab = (where) => (where ?? "").split(" / ").slice(1).join(" / ");
 
-// The live terminals of one space: those in its tabs' panes, their sub-agents (found by parent),
-// and anything carrying the space's herdr.space label.
-function activeTerms(space) {
+// The live terminals of one tab: those in its panes, anything carrying its herdr.tab label, and
+// their sub-agents (found by parent), which have no pane of their own.
+function activeTerms(tab) {
   const all = liveTerminals();
-  const tabs = new Set(space.tabs.map((t) => t.id));
-  const local = localSpaceId(space);
-  const keep = new Set(panes().filter((p) => p.terminal && tabs.has(p.tab)).map((p) => p.terminal));
-  for (const t of all) if (t.space_label && t.space_label === local) keep.add(t.address);
+  const local = localId(tab.id);
+  const keep = new Set(panes().filter((p) => p.terminal && p.tab === tab.id).map((p) => p.terminal));
+  for (const t of all) if (t.tab_label && t.tab_label === local) keep.add(t.address);
   const kids = new Map();
   for (const t of all) {
     const key = qualify(t.parent, t.address);
@@ -113,6 +180,26 @@ function glyph(t, v, size) {
 }
 
 // What a card or row shows, derived once per model.
+// Herdr's agent programs (knownAgents: name, icon, tint) by table key and icon name, once loaded,
+// so a recorded card can show its agent's logo like a live one. hc's agent words that differ
+// from the table's keys are mapped first.
+let agentPrograms = null;
+const AGENT_KEYS = { "claude-code": "claude", "grok-build": "grok", cmd: "command-code" };
+function loadAgentPrograms(list) {
+  const map = new Map();
+  for (const p of list ?? []) {
+    if (!p?.icon) continue;
+    const icon = p.icon.slice(p.icon.lastIndexOf("/") + 1).replace(/\.[^.]+$/, "");
+    for (const k of [p.key, icon]) if (k && !map.has(k)) map.set(k, { name: p.name, icon: p.icon, tint: p.tint, agent: true });
+  }
+  agentPrograms = map;
+}
+function recordedProgram(rec) {
+  if (!rec || !agentPrograms) return null;
+  const word = agentOf(rec);
+  return agentPrograms.get(AGENT_KEYS[word] ?? word) ?? null;
+}
+
 function describe(n, worked) {
   if (n.ghost) return { ghost: true, title: n.address };
   const f = facts(n);
@@ -128,7 +215,7 @@ function describe(n, worked) {
     title: name,
     meta: [n.address, program, f.removed != null ? "removed" : null, f.notSeen ? "not seen" : null,
       command && command !== program ? command : null].filter(Boolean).join(" · "),
-    program: n.live?.program ?? null,
+    program: n.live?.program ?? recordedProgram(n.rec),
     letter: (n.rec?.agent || name || "?").replace(/[^\p{L}\p{N}]/gu, "").charAt(0).toUpperCase() || "?",
     done: isDone(n, f, o, worked),
     resumable,
@@ -139,16 +226,11 @@ function describe(n, worked) {
 
 export default class AgentGraph extends View {
   init(_props, cx) {
-    this.path = props()?.history || `${home()}/.local/share/herdr-agent-graph/history.json`;
-    this.records = [];
-    // Load ids: the latest started, and the one still running (null when none is).
-    this.loads = 0;
-    this.loading = null;
+    this.path = historyPath(props()?.history);
     this.token = shared("agent-graph.shown") ?? null;
+    this.shown = isShown();
     this.fh = cx.focus_handle();
     this.fh.focus();
-    this.missing = false;
-    this.error = null;
     this.size = null;
     this.model = { runs: [] };
     // The graph point at the viewport's top-left: Reset and Center move it, and cards outside
@@ -156,16 +238,38 @@ export default class AgentGraph extends View {
     this.origin = { x: 0, y: 0 };
     // What the last cull of the viewport drew; a render with the same run, origin and size
     // reuses it instead of walking the run again.
-    this.culled = null;
+    this.hostId = `g${++hostSeq}`;
+    hosts.set(this.hostId, this);
+    this.slab = null;
+    this.slabVer = 0;
+    this.slabView = cx.new(Slab, { host: this.hostId, v: 0 });
+    // Set by a pan: the render it causes skips the live-data checks.
+    this.panOnly = false;
     this.centred = false;
-    // The space whose graph this is: the one shown when the snapshot was taken.
-    this.space = null;
     // Agents seen working here: an idle one among them has done its part.
     this.worked = new Set(store.get("worked", []));
-    // When the snapshot the graph shows was taken. Nothing polls.
-    this.refreshed = null;
-    // One read when it starts; after that, opening the panel, a space change or Refresh.
-    this.refresh(cx);
+    // Owns every update; its space, error, missing and ready are what the bar shows.
+    this.live = new Live({
+      isShown,
+      snapshot: () => this.snapshot(),
+      readHistory: () => readTextFile(this.path),
+      parse: parseHistory,
+      build: (input, cx) => this.build(input, cx),
+      graphKey: (model) => this.graphKey(model),
+      barKey,
+      publish: (model, change, cx) => this.publish(model, change, cx),
+    });
+    // The watcher's first resync is the first load.
+    cx.spawn(async (cx) => this.live.watch(cx, watchFolder, this.path));
+    cx.timer.every(60000, (cx) => this.ageCards(cx));
+    // Recorded cards get their agent's logo once Herdr says which agents it knows; a pass is
+    // forced because the logos aren't part of the inputs the coordinator compares.
+    cx.spawn(async (cx) => {
+      try {
+        loadAgentPrograms(await knownAgents());
+        this.live.request(cx, { force: true });
+      } catch {}
+    });
     cx.spawn(async (cx) => {
       for (;;) {
         const command = await nextCommand();
@@ -173,57 +277,26 @@ export default class AgentGraph extends View {
           hide();
           continue;
         }
-        this.refresh(cx);
+        this.live.request(cx, { reread: true, force: true });
       }
     });
   }
 
-  // Reads the history and snapshots the active space's terminals: the only place live data comes in.
-  // A failed read or parse keeps the previous records and shows the error in the bar.
-  async load(cx, id) {
-    this.loading = id;
-    const space = spaces().find((s) => s.active) ?? null;
-    this.space = space ? { id: space.id, name: space.name } : null;
-    const terms = space ? activeTerms(space) : [];
-    this.error = null;
-    let text = null;
-    try {
-      text = await readTextFile(this.path);
-    } catch (e) {
-      this.error = `Couldn't read history: ${e?.message ?? e}`;
-    }
-    if (!this.error) {
-      this.missing = text == null;
-      try {
-        this.records = this.missing ? [] : parseHistory(text);
-      } catch (e) {
-        this.error = `Couldn't parse history: ${e?.message ?? e}`;
-      }
-    }
-    await this.build(cx, terms, id);
-    if (this.loading !== id) return;
-    this.refreshed = Date.now();
-    this.loading = null;
+  // The shown tab of the active space and its terminals, sorted, with the key a pass compares: the
+  // only place live data comes in. Switching tabs changes the key, so the graph follows the tab.
+  snapshot() {
+    const active = spaces().find((s) => s.active) ?? null;
+    const tab = active?.tabs.find((t) => t.active) ?? null;
+    const space = active ? { id: active.id, name: active.name, tab: tab ? { id: tab.id, name: tab.name } : null } : null;
+    const terms = tab ? activeTerms(tab) : [];
+    terms.sort((a, b) => (a.address < b.address ? -1 : a.address > b.address ? 1 : (a.created_ms ?? 0) - (b.created_ms ?? 0)));
+    return { space, terms, key: JSON.stringify([space, terms]) };
   }
 
-  // A cold load can run for seconds, and Herdr may stop a script that runs too long: the load
-  // then never finishes and the panel would stay empty. The watchdog retries it once, warmer.
-  refresh(cx) {
-    const id = ++this.loads;
-    cx.spawn(async (cx) => {
-      await this.load(cx, id);
-      cx.notify();
-    });
-    cx.spawn(async (cx) => {
-      await cx.sleep(10000);
-      if (this.loading === id) this.refresh(cx);
-    });
-  }
-
-  // Runs of this space and what every card says: built off the render path, once per read, in
-  // steps that yield between them so the window can draw.
-  async build(cx, terms, id) {
-    const merged = merge(this.records, terms);
+  // Runs of this tab and what every card says: built off the render path, in steps that yield
+  // between them so the window can draw. Uses only the pass's snapshot.
+  async build({ space, terms, records }, cx) {
+    const merged = merge(records, terms);
     await cx.sleep(0);
     let added = false;
     for (const r of merged) {
@@ -239,18 +312,82 @@ export default class AgentGraph extends View {
       this.worked = new Set(keep);
       store.set("worked", keep);
     }
-    const name = this.space?.name ?? null;
-    const runs = merged.filter((r) => r.nodes.some((n) => n.live || (name && whereSpace(n.rec?.where) === name)));
+    // A run with a live terminal of this tab, or recorded in this space and tab (by name: a tab
+    // nobody named is called by its position).
+    const name = space?.name ?? null;
+    const tabName = space?.tab?.name ?? null;
+    const here = (where) => Boolean(name && tabName) && whereSpace(where) === name && whereTab(where) === tabName;
+    const runs = merged.filter((r) => r.nodes.some((n) => n.live || here(n.rec?.where)));
     const worked = (nid) => this.worked.has(nid);
     for (const r of runs) for (const n of r.nodes) n.v = describe(n, worked);
     await cx.sleep(0);
     orderRuns(runs);
-    // A newer load took over while this one yielded: its result wins.
-    if (this.loading !== id) return;
-    this.model = { runs };
+    return { runs };
   }
 
-  // Columns, headers, links and the active wave of one run, kept with the model. Nodes and
+  // The headers and the bar's count of a model: column totals, the deepest working agent, agents.
+  headKey(model) {
+    const cur = model.runs[0];
+    if (!cur) return "";
+    const { g, cols, wave } = this.shape(cur);
+    return JSON.stringify([cur.sum.agents, g.cols, cols, wave && [wave.col, wave.row, wave.id]]);
+  }
+
+  // Everything the graph draws of a model: headers, and every card of its run where it sits.
+  graphKey(model) {
+    const cur = model.runs[0];
+    if (!cur) return "";
+    const { g } = this.shape(cur);
+    const rows = [this.headKey(model)];
+    for (const n of cur.nodes) {
+      const p = g.pos.get(n.id);
+      rows.push(`${p.col},${p.row},${n.parent?.id ?? ""},${cardKey(n)}`);
+    }
+    return rows.join("\n");
+  }
+
+  // Shows what a pass changed. A new graph whose slab draws the same as the current one replaces
+  // it quietly; otherwise the slab gets new props. The host redraws only for what it draws.
+  publish(model, { graph, bar, force }, cx) {
+    let redraw = bar || force;
+    if (graph) {
+      const head = this.headKey(this.model);
+      const { x, y } = this.origin;
+      const prev = this.slab;
+      this.model = model;
+      const cur = model.runs[0] ?? null;
+      if (cur) this.origin = this.clampOrigin(x, y);
+      const next = cur ? this.buildSlab(cur) : null;
+      if (!force && prev && next && slabKey(prev) === slabKey(next)) {
+        next.labels = prev.labels;
+        this.slab = next;
+        if (this.origin.x !== x || this.origin.y !== y || this.headKey(model) !== head) redraw = true;
+      } else if (prev || next) {
+        this.slab = next;
+        this.slabView.set_props({ host: this.hostId, v: ++this.slabVer });
+        redraw = true;
+      }
+    }
+    if (redraw) cx.notify();
+  }
+
+  // Whether a drawn aging card's duration text differs from what the slab last drew.
+  slabAged(now) {
+    const s = this.slab;
+    if (!s?.labels) return false;
+    for (const d of s.drawn) {
+      const f = d.n.v.f;
+      if (f && aging(f) && ageText(f, now) !== s.labels.get(d.n.id)) return true;
+    }
+    return false;
+  }
+
+  // Durations advance by redrawing only the slab, and only when a drawn one would read differently.
+  ageCards(cx) {
+    if (isShown() && this.slabAged(Date.now())) cx.notify(this.slabView);
+  }
+
+  // Columns, headers, links and the deepest working agent of one run, kept with the model. Nodes and
   // links are bucketed by column too, so a render visits only the columns the viewport shows.
   shape(r) {
     if (r.shape) return r.shape;
@@ -286,72 +423,119 @@ export default class AgentGraph extends View {
     return r.shape;
   }
 
-  // The cards and links a viewport of one run draws, cached between renders: only the columns
-  // crossing the viewport are visited, and live-data changes redraw from this data.
-  cull(cur) {
+  // Whether the current slab still covers the viewport: the same run and size, the viewport inside
+  // its area, and no budgeted-out card in view.
+  slabCovers(cur) {
+    const s = this.slab;
+    const { vw, vh } = this.viewport();
+    const bh = Math.max(1, vh - HEAD_H);
+    if (!s || s.cur !== cur || s.vw !== vw || s.vh !== vh) return false;
+    const vx = this.origin.x - s.x0;
+    const vy = this.origin.y - s.y0;
+    if (vx < 0 || vy < 0 || vx + vw > s.sw || vy + bh > s.sh) return false;
+    for (const c of s.cut) if (c.x < vx + vw && c.x + CARD_W > vx && c.y < vy + bh && c.y + CARD_H > vy) return false;
+    return true;
+  }
+
+  // Rebuilds the slab around the viewport when it no longer covers it (or when forced after a load),
+  // and tells the Slab child to draw it. Only from event handlers and tasks, never from render.
+  ensureSlab(force = false) {
+    const cur = this.model.runs[0] ?? null;
+    if (!cur) {
+      if (this.slab) { this.slab = null; this.slabView.set_props({ host: this.hostId, v: ++this.slabVer }); }
+      return;
+    }
+    if (!force && this.slabCovers(cur)) return;
+    this.slab = this.buildSlab(cur);
+    this.slabView.set_props({ host: this.hostId, v: ++this.slabVer });
+  }
+
+  // The cards and links of the viewport plus a margin, in slab coordinates (graph coordinates
+  // minus x0, y0). At most MAX_CARDS, nearest the viewport's centre first; the rest are `cut`, and
+  // the slab is rebuilt as soon as one of them would come into view.
+  buildSlab(cur) {
     const { g, wave, byCol, linksByCol } = this.shape(cur);
+    const { vw, vh } = this.viewport();
+    const bh = Math.max(1, vh - HEAD_H);
     const ox = this.origin.x;
     const oy = this.origin.y;
-    const { vw, vh } = this.viewport();
-    const last = this.culled;
-    if (last && last.cur === cur && last.ox === ox && last.oy === oy && last.vw === vw && last.vh === vh) return last;
-    const midX = vw / 2;
-    const midY = vh / 2;
+    const x0 = Math.max(0, ox - SLAB_MX);
+    const y0 = Math.max(0, oy - SLAB_MY);
+    const sw = ox + vw + SLAB_MX - x0;
+    const sh = oy + bh + SLAB_MY - y0;
+    const midX = ox + vw / 2 - x0;
+    const midY = oy + bh / 2 - y0;
 
-    // Cards inside the fixed viewport and nearest its centre, at most MAX_CARDS: anything past
-    // an edge is not built, so a huge run costs a screenful, never its whole canvas.
     const placed = [];
     for (let col = 0; col < g.cols; col++) {
-      const x = colX(col) - ox;
-      if (!(x + CARD_W > 0 && x < vw)) continue;
+      const x = colX(col) - x0;
+      if (!(x + CARD_W > 0 && x < sw)) continue;
       for (const n of byCol[col]) {
-        const y = HEAD_H + rowY(g.pos.get(n.id).row) - oy;
-        // Build partly visible cards too; the canvas clips them at its edges.
-        if (y + CARD_H > HEAD_H && y < vh) placed.push({ n, x, y, col });
+        const y = rowY(g.pos.get(n.id).row) - y0;
+        if (y + CARD_H > 0 && y < sh) placed.push({ n, x, y, col });
       }
     }
+    // Cards in the viewport first, so the margin only gets what the budget leaves; then nearest
+    // its centre.
+    const vx = ox - x0;
+    const vy = oy - y0;
+    const inView = (d) => (d.x < vx + vw && d.x + CARD_W > vx && d.y < vy + bh && d.y + CARD_H > vy ? 0 : 1);
     const rank = (d) => (d.x + CARD_W / 2 - midX) ** 2 + (d.y + CARD_H / 2 - midY) ** 2;
-    placed.sort((a, b) => rank(a) - rank(b) || a.y - b.y || a.x - b.x);
+    placed.sort((a, b) => inView(a) - inView(b) || rank(a) - rank(b) || a.y - b.y || a.x - b.x);
     let drawn = placed.slice(0, MAX_CARDS);
-    // The root and the wave stay built even when the budget is full: the graph must not lose
-    // the run it starts from, and Center active wave must draw what it centres on.
+    // The root and the deepest working agent stay built even when the budget is full: the graph
+    // must not lose the run it starts from, and Center must draw what it centres on.
     for (const id of [cur.root.id, wave?.id]) {
       if (!id || drawn.some((d) => d.n.id === id)) continue;
       const d = placed.find((p) => p.n.id === id);
       if (d) drawn = [d, ...drawn.slice(0, MAX_CARDS - 1)];
     }
-    const hidden = cur.nodes.length - drawn.length;
     const shownIds = new Set(drawn.map((d) => d.n.id));
     const shownCols = new Set(drawn.map((d) => d.col));
     const placedIds = new Set(placed.map((d) => d.n.id));
+    const cut = placed.filter((d) => !shownIds.has(d.n.id)).map((d) => ({ x: d.x, y: d.y }));
 
-    // Links whose parent column crosses the viewport: draw those between real ends, and stub
-    // out a budgeted-out parent.
+    // Links whose parent column crosses the slab: draw those between real ends, and stub out a
+    // budgeted-out parent.
     const linkGeo = [];
     for (let c = 0; c < g.cols; c++) {
-      if (!(colX(c + 1) - ox > 0 && colX(c) + CARD_W - ox < vw)) continue;
+      if (!(colX(c + 1) - x0 > 0 && colX(c) + CARD_W - x0 < sw)) continue;
       for (const l of linksByCol[c]) {
-        const x1 = l.x1 - ox;
-        const y1 = l.y1 - oy;
-        const x2 = l.x2 - ox;
-        const y2 = l.y2 - oy;
+        const x1 = l.x1 - x0;
+        const y1 = l.y1 - y0;
+        const x2 = l.x2 - x0;
+        const y2 = l.y2 - y0;
         const parentReal = shownIds.has(l.pid) || !placedIds.has(l.pid);
         const childReal = shownIds.has(l.id) || !placedIds.has(l.id);
-        if (parentReal && childReal && x2 > 0 && x1 < vw && Math.max(y1, y2) > 0 && Math.min(y1, y2) < vh - HEAD_H) {
+        if (parentReal && childReal && x2 > 0 && x1 < sw && Math.max(y1, y2) > 0 && Math.min(y1, y2) < sh) {
           linkGeo.push({ elbow: true, x1, y1, x2, y2, kind: l.kind });
         } else if (shownIds.has(l.id) && !parentReal && x2 > 0) {
           linkGeo.push({ elbow: false, x2, y2, kind: l.kind });
         }
       }
     }
-    this.culled = { cur, ox, oy, vw, vh, drawn, hidden, shownIds, placedIds, shownCols, linkGeo };
-    return this.culled;
+    return { cur, vw, vh, x0, y0, sw, sh, drawn, cut, hidden: cur.nodes.length - drawn.length, shownCols, linkGeo };
+  }
+
+  // What the Slab child draws: links under cards, positioned in slab coordinates. Keeps the
+  // duration texts it drew of aging cards, for ageCards.
+  slabElement(t, s, now) {
+    const labels = new Map();
+    const links = [];
+    for (const l of s.linkGeo) {
+      if (l.elbow) links.push(...this.elbow(l.x1, l.y1, l.x2, l.y2, linkTone(t, l.kind)));
+      else links.push(div().absolute().left(Math.max(0, l.x2 - 24)).top(l.y2 - LINK / 2).w(Math.min(24, l.x2)).h(LINK).bg(linkTone(t, l.kind)));
+    }
+    const cards = s.drawn.map((d) => this.card(t, d.n, d.x, d.y, now, labels));
+    s.labels = labels;
+    return div().relative().w(s.sw).h(s.sh).children(links).children(cards);
   }
 
   // Both buttons move what the fixed viewport shows; the card budget follows it.
   resetView(cx) {
     this.origin = { x: 0, y: 0 };
     this.centred = false;
+    this.ensureSlab();
     cx.notify();
   }
 
@@ -377,6 +561,10 @@ export default class AgentGraph extends View {
     if (x === this.origin.x && y === this.origin.y) return;
     this.origin = { x, y };
     this.centred = false;
+    // Usually only the slab's wrapper moves; cards are rebuilt only at the slab's edge.
+    this.ensureSlab();
+    this.panOnly = true;
+    this.live.panned(cx);
     cx.notify();
   }
 
@@ -391,6 +579,7 @@ export default class AgentGraph extends View {
       HEAD_H + rowY(wave.row) + CARD_H / 2 - vh / 2,
     );
     this.centred = true;
+    this.ensureSlab();
     cx.notify();
   }
 
@@ -404,18 +593,36 @@ export default class AgentGraph extends View {
     } catch (error) { notify({ title: "Cannot resume session", body: String(error) }); }
   }
 
+  close() {
+    hosts.delete(this.hostId);
+  }
+
   render(cx) {
-    if (!isShown()) return div().size_full();
-    const token = shared("agent-graph.shown") ?? null;
-    if (token !== this.token) {
-      this.token = token;
-      this.refresh(cx);
-      cx.spawn(async (cx) => { await cx.sleep(0); this.fh.focus(); });
+    // A pan's render: it's shown (it got the wheel), and live data is checked after the pan.
+    const panOnly = this.panOnly;
+    this.panOnly = false;
+    if (!panOnly) {
+      if (!isShown()) {
+        this.shown = false;
+        return div().size_full();
+      }
+      const token = shared("agent-graph.shown") ?? null;
+      if (token !== this.token || !this.shown) {
+        // Shown again: a pass (the history reread only if stale), and durations brought up to date.
+        const opened = token !== this.token;
+        this.token = token;
+        this.shown = true;
+        this.live.request(cx);
+        cx.spawn(async (cx) => {
+          await cx.sleep(0);
+          if (opened) this.fh.focus();
+          this.ageCards(cx);
+        });
+      } else {
+        this.live.observe(cx, this.snapshot());
+      }
     }
-    const active = spaces().find((s) => s.active);
-    if (this.refreshed && active && active.id !== this.space?.id) this.refresh(cx);
     const t = theme();
-    const now = Date.now();
     const cur = this.model.runs[0] ?? null;
 
     const root = v_flex()
@@ -426,6 +633,8 @@ export default class AgentGraph extends View {
         // Only a real change: notifying on every report would render in a loop.
         if (this.size && Math.round(this.size.width) === Math.round(size.width) && Math.round(this.size.height) === Math.round(size.height)) return;
         this.size = size;
+        if (this.model.runs[0]) this.origin = this.clampOrigin(this.origin.x, this.origin.y);
+        this.ensureSlab();
         cx.notify();
       })
       .size_full()
@@ -436,7 +645,7 @@ export default class AgentGraph extends View {
       .text_color(t.foreground);
 
     if (!cur) return root.child(this.bar(t)).child(this.empty(t));
-    return root.child(this.graph(t, cur, now));
+    return root.child(this.graph(t, cur));
   }
 
   // A bar button, icon only: quiet at rest, hover lights it.
@@ -458,15 +667,15 @@ export default class AgentGraph extends View {
   bar(t, hidden = 0) {
     const cur = this.model.runs[0] ?? null;
     const { g, wave } = cur ? this.shape(cur) : {};
+    const { error, missing } = this.live;
     const bits = [];
-    if (this.refreshed) bits.push(`snapshot ${clock(this.refreshed, Date.now())}`);
     if (cur) {
-      bits.push(`${cur.sum.agents} agents · wave ${g.cols - 1}`);
-      if (this.centred) bits.push("centred on the active wave");
+      bits.push(`${cur.sum.agents} agents · depth ${g.cols - 1}`);
+      if (this.centred) bits.push("centred on the deepest working agent");
       if (hidden > 0) bits.push(`${hidden} not drawn`);
     }
-    if (this.error) bits.push(this.error);
-    else if (this.missing) bits.push("no recorded history yet");
+    if (error) bits.push(error);
+    else if (missing) bits.push("no recorded history yet");
     return h_flex()
       .h(BAR_H)
       .flex_none()
@@ -478,46 +687,39 @@ export default class AgentGraph extends View {
       .bg(t.surface)
       .text_size(12)
       .child(h_flex().flex_1().min_w(0).overflow_hidden().gap(8).items_center()
-        .child(div().min_w(0).flex_shrink_0().max_w(160).truncate().font_semibold().text_color(t.foreground).child(this.space?.name ?? "No active space"))
-        .children(bits.map((text) => div().flex_none().text_color(t.dim).child(`· ${text}`))))
-      .child(this.button(t, "refresh", "mods/agent-graph/icons/refresh.svg", true, (_e, cx) => this.refresh(cx)))
+        .children(bits.map((text, i) => div().flex_none().text_color(t.dim).child(i ? `· ${text}` : text))))
       .child(this.button(t, "center", "mods/agent-graph/icons/crosshair.svg", Boolean(wave), (_e, cx) => this.centerWave(cx)))
       .child(this.button(t, "reset", "mods/agent-graph/icons/undo.svg", Boolean(cur) && (this.origin.x > 0 || this.origin.y > 0), (_e, cx) => this.resetView(cx)))
       .child(this.button(t, "close", "mods/workspace-chrome/x.svg", true, () => hide()));
   }
 
   empty(t) {
-    const text = !this.refreshed ? "" : "No agents in this space yet. Refresh after one starts another.";
+    // Blank until the first pass has finished, so it never flashes before the first load.
+    const text = this.live.ready ? "No agents in this tab yet." : "";
     return div().flex_1().p(24).text_size(12).text_color(t.dim).child(text);
   }
 
   // ---- the graph: column headers, links and cards on one fixed canvas
 
-  graph(t, cur, now) {
+  graph(t, cur) {
     const s = this.shape(cur);
     const { wave } = s;
     this.origin = this.clampOrigin(this.origin.x, this.origin.y);
     const ox = this.origin.x;
     const oy = this.origin.y;
     const { vw, vh } = this.viewport();
-    const { drawn, hidden, shownCols, linkGeo } = this.cull(cur);
+    const slab = this.slab?.cur === cur ? this.slab : null;
 
-    const bar = this.bar(t, hidden);
+    const bar = this.bar(t, slab?.hidden ?? 0);
 
     const heads = [];
     s.cols.forEach((c, col) => {
       const x = colX(col) - ox;
-      if (x + CARD_W > 0 && x < vw && shownCols.has(col)) heads.push(this.header(t, c, col, x, wave?.col === col));
+      if (x + CARD_W > 0 && x < vw && slab?.shownCols.has(col)) heads.push(this.header(t, c, col, x, wave?.col === col));
     });
-    // Draw viewport-crossing links between real ends; use a stub for a budgeted-out parent.
-    const links = [];
-    for (const l of linkGeo) {
-      if (l.elbow) links.push(...this.elbow(l.x1, l.y1, l.x2, l.y2, linkTone(t, l.kind)));
-      else links.push(div().absolute().left(Math.max(0, l.x2 - 24)).top(l.y2 - LINK / 2).w(Math.min(24, l.x2)).h(LINK).bg(linkTone(t, l.kind)));
-    }
+    // The slab is a retained child: moving its wrapper is all a pan inside it costs.
     const body = div().absolute().left(0).top(HEAD_H).w(vw).h(Math.max(1, vh - HEAD_H)).overflow_hidden()
-      .children(links)
-      .children(drawn.map((d) => this.card(t, d.n, d.x, d.y - HEAD_H, now)));
+      .when(Boolean(slab), (el) => el.child(div().absolute().left(slab.x0 - ox).top(slab.y0 - oy).w(slab.sw).h(slab.sh).child(this.slabView)));
     const canvas = div()
       .relative()
       .flex_none()
@@ -554,7 +756,7 @@ export default class AgentGraph extends View {
 
   header(t, c, col, x, active) {
     const bits = [
-      { text: col === 0 ? "Root" : `Wave ${col}`, color: active ? t.foreground : t.muted },
+      { text: col === 0 ? "Root" : `Depth ${col}`, color: active ? t.foreground : t.muted },
       { text: c.total ? `${c.done}/${c.total} done` : "removed before recording", color: t.dim },
       c.working && { text: `${c.working} working`, color: t.working },
       c.failed && { text: `${c.failed} failed`, color: t.ansi1 },
@@ -574,7 +776,7 @@ export default class AgentGraph extends View {
       .children(bits.map((b, i) => div().flex_none().text_color(b.color).child(i ? `· ${b.text}` : b.text)));
   }
 
-  card(t, n, x, y, now) {
+  card(t, n, x, y, now, labels) {
     const v = n.v;
     const box = v_flex().id(`card-${n.id}`).absolute().left(x).top(y).w(CARD_W).h(CARD_H).rounded(7).border(1).px(10).py(7).gap(3);
     if (v.ghost) {
@@ -583,7 +785,9 @@ export default class AgentGraph extends View {
         .child(div().text_size(11).text_color(t.dim).child("removed before recording"));
     }
     const f = v.f;
-    const meta = [duration((f.finished ?? f.removed ?? now) - (f.created ?? now)), v.meta].filter(Boolean).join(" · ");
+    const age = ageText(f, now);
+    if (aging(f)) labels?.set(n.id, age);
+    const meta = [age, v.meta].filter(Boolean).join(" · ");
     const word = div().flex_none().text_color(t[TONE[v.o.kind] ?? "muted"]).when(v.loud, (el) => el.font_semibold()).child(v.o.word);
     const title = div().min_w(0).truncate().text_size(12.5).font_medium().child(v.title);
     return box
@@ -591,7 +795,7 @@ export default class AgentGraph extends View {
       .border_color(v.loud ? t.blocked : t.border)
       .when(f.removed != null, (el) => el.opacity(0.55))
       .when(v.peekable || v.resumable, (el) => el.cursor_pointer().hover((s) => s.border_color(t.accent)).on_click(() => v.peekable ? run("terminal.peek", { terminal: n.address }) : this.resume(n)))
-      // Only a live card carries its program's icon; recorded cards say the program in the meta.
+      // A live card carries its program's icon; a recorded agent's card its agent's logo.
       .child(v.program?.icon ? h_flex().gap(7).items_center().child(glyph(t, v, 14)).child(title.flex_1()) : title.w_full())
       .child(word)
       .child(div().truncate().text_size(11).text_color(t.dim).child(meta));

@@ -5,6 +5,6 @@ Mods for [Herdr](https://herdr.dev). Each one is a folder under `mods/` with a `
 
 | Mod | What it does |
 |---|---|
-| [agent-graph](mods/agent-graph) | The active space's agents as a spawn tree, with finished ones kept by a small recorder; click to peek or resume a session. |
+| [agent-graph](mods/agent-graph) | The shown tab's agents as a live spawn tree, with finished ones kept by a small recorder; click to peek or resume a session. |
 
 To add one, ask your agent: "Add the herdr mod at github.com/armedi/herdr-mods/tree/main/mods/<name>".
