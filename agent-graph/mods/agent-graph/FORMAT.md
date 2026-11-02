@@ -5,7 +5,9 @@ The recorder (`recorder.py`) writes it; the mod (`main.js`) reads it. Neither ch
 File: `~/.local/share/herdr-agent-graph/history.json`, replaced atomically (write a temp file
 named `history.json.<pid>.tmp` in the same folder, then rename). One recorder at a time holds an
 exclusive `fcntl.flock` on `history.lock` in that folder. The serialized file is always under
-900,000 bytes, so `readTextFile` (1 MiB limit) can read it.
+900,000 bytes, so `readTextFile` (1 MiB limit) can read it. A file that can't be read, or isn't a
+version 1 history, is kept aside as `history.json.bad-<epoch>` before the recorder starts empty,
+so a bad read never destroys it.
 
 ```json
 {
@@ -52,6 +54,7 @@ exclusive `fcntl.flock` on `history.lock` in that folder. The serialized file is
   spaces), `cwd` 300, `name` 120, `where` 160.
 - Times are Unix milliseconds. Records are sorted by `created_ms` ascending.
 - Kept: every record still in the core, plus removed or finished ones whose latest timestamp is
-  within 14 days, at most 1500 records in total (current records are never dropped, even past
-  1500). If the file would still reach 900,000 bytes, more of the oldest non-current records
-  are dropped until it fits.
+  within 14 days. Non-current records are capped at 1500 in total; current records are exempt from
+  that count. If the file would still reach 900,000 bytes, the oldest non-current records are
+  dropped first; if only current records remain and it is still too large, the oldest of those are
+  dropped too, so the serialized file always fits the reader's 1 MiB limit.

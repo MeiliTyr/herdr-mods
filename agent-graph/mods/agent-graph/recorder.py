@@ -101,6 +101,33 @@ class Recorder:
 
     # -- loading ---------------------------------------------------------
 
+    def preserve(self, path, why):
+        """Move a history we can't use aside, so the next write can't destroy it.
+
+        Raises OSError when it can't: the caller must then abort rather than start empty and
+        overwrite the original. The name is reserved with O_EXCL so a second attempt in the same
+        second (or a restart) can't clobber an earlier backup.
+        """
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        for i in range(1, 1001):
+            aside = f"{path}.bad-{stamp}" if i == 1 else f"{path}.bad-{stamp}.{i}"
+            try:
+                fd = os.open(aside, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                continue
+            os.close(fd)
+            try:
+                os.replace(path, aside)
+            except OSError:
+                try:
+                    os.unlink(aside)
+                except OSError:
+                    pass
+                raise
+            log(f"kept {path} as {aside} ({why})")
+            return
+        raise OSError(f"no free name to set {path} aside ({why})")
+
     def load(self, path):
         try:
             with open(path, "rb") as f:
@@ -108,11 +135,12 @@ class Recorder:
         except FileNotFoundError:
             return
         except (OSError, ValueError) as e:
-            log(f"cannot read {path}: {e}; starting empty")
+            # Unsure of the file: keep it aside (may raise OSError and abort startup).
+            self.preserve(path, f"cannot read it: {e}")
             return
         if (not isinstance(data, dict) or data.get("version") != VERSION
                 or not isinstance(data.get("records"), list)):
-            log(f"ignoring {path}: not a version {VERSION} history; starting empty")
+            self.preserve(path, f"not a version {VERSION} history")
             return
         for r in data["records"]:
             if (not isinstance(r, dict) or not isinstance(r.get("address"), str)
@@ -316,12 +344,19 @@ class Recorder:
             if len(dump(d)) < SIZE_LIMIT:
                 return d
             current = set(self.current.values())
-            others = sorted((r for i, r in self.records.items() if i not in current),
-                            key=lambda r: (r["created_ms"], r["id"]))
+            others = [r for i, r in self.records.items() if i not in current]
             if not others:
-                return d
+                # Nothing but current records left: an over-limit file can't be read back, so
+                # the oldest current ones go too. Their terminals still show from the core.
+                others = list(self.records.values())
+                if not others:
+                    return d
+                log(f"history over {SIZE_LIMIT} bytes with only current records; dropping the oldest")
+            others.sort(key=lambda r: (r["created_ms"], r["id"]))
             for r in others[:max(1, len(others) // 10)]:
                 del self.records[r["id"]]
+                if self.current.get(r["address"]) == r["id"]:
+                    del self.current[r["address"]]
             self.touch()
 
     def flush(self, path, now):
@@ -495,7 +530,11 @@ def main(argv=None):
         print(f"another recorder holds {lock_path}", file=sys.stderr)
         return 1
     rec = Recorder()
-    rec.load(out)
+    try:
+        rec.load(out)
+    except OSError as e:
+        log(f"refusing to start: {e}")
+        return 1
     if args.replay:
         with open(args.replay, encoding="utf-8", errors="replace") as f:
             for line in f:

@@ -6,11 +6,13 @@ import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 from urllib.parse import quote
 
 # Keep in step with RESUMABLE in model.js.
 ALIASES = {'claude': 'claude', 'claude-code': 'claude', 'codex': 'codex',
-           'grok': 'grok', 'grok-build': 'grok', 'cmd': 'cmd', 'command-code': 'cmd'}
+           'grok': 'grok', 'grok-build': 'grok', 'cmd': 'cmd', 'command-code': 'cmd',
+           'copilot': 'copilot', 'opencode': 'opencode'}
 
 
 def first_json(path, limit=1):
@@ -85,9 +87,62 @@ def grok_sessions(home, cwd, created):
             continue
 
 
+def yaml_scalar(value):
+    """A plain YAML scalar as the Copilot workspace files use them: strip matching quotes and
+    read empty/null/~ as None. Block/flow forms are not supported and fall back to the raw text."""
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+        inner = value[1:-1]
+        if value[0] == '"':
+            return inner.replace('\\"', '"').replace('\\\\', '\\')
+        return inner.replace("''", "'")
+    return None if value in ('', '~', 'null', 'Null', 'NULL') else value
+
+
+def copilot_sessions(home, cwd, created):
+    """Copilot CLI keeps one session per folder under ~/.copilot/session-state/<id>/."""
+    folder = home / '.copilot/session-state'
+    for path in fresh(folder.glob('*/workspace.yaml'), created):
+        try:
+            data = {}
+            for line in path.read_text(encoding='utf-8', errors='replace').splitlines():
+                key, sep, value = line.partition(':')
+                if sep and key.strip() not in data:
+                    data[key.strip()] = yaml_scalar(value)
+            yield data.get('id') or path.parent.name, data.get('cwd'), millis(data.get('created_at'))
+        except (OSError, UnicodeError):
+            continue
+
+
+def opencode_sessions(home, cwd, created):
+    """OpenCode keeps sessions in a SQLite db (~/.local/share/opencode/opencode.db).
+
+    Opened `mode=ro`: no SQL writes. A normal read transaction can still take a shared lock and
+    touch the WAL's -shm/-wal bookkeeping, which is expected for a live store (immutable=1 would
+    skip those but can miss sessions still only in the WAL)."""
+    path = home / '.local/share/opencode/opencode.db'
+    if not path.exists():
+        return
+    try:
+        con = sqlite3.connect(f'{path.as_uri()}?mode=ro', uri=True)
+    except sqlite3.Error:
+        return
+    try:
+        rows = con.execute(
+            'select id, directory, time_created from session where directory = ? and time_created >= ?',
+            (cwd, created),
+        ).fetchall()
+    except sqlite3.Error:
+        return
+    finally:
+        con.close()
+    for sid, directory, start in rows:
+        yield sid, directory, start
+
+
 # Per agent: where its sessions are, and the argument that resumes one (alone it opens a picker).
-READERS = {'codex': codex_sessions, 'claude': claude_sessions, 'cmd': cmd_sessions, 'grok': grok_sessions}
-RESUME = {'codex': 'resume', 'claude': '--resume', 'cmd': '--resume', 'grok': '--resume'}
+READERS = {'codex': codex_sessions, 'claude': claude_sessions, 'cmd': cmd_sessions, 'grok': grok_sessions, 'copilot': copilot_sessions, 'opencode': opencode_sessions}
+RESUME = {'codex': 'resume', 'claude': '--resume', 'cmd': '--resume', 'grok': '--resume', 'copilot': '--resume', 'opencode': '--session'}
 
 
 def kind(rec):
@@ -119,7 +174,15 @@ def resolve(rec, records, home):
     session = earliest[0] if len(earliest) == 1 else None
     if agent == 'grok' and session is None:
         return {'error': 'Exact Grok session not found; this Grok version has no documented interactive resume picker. Use grok sessions list to inspect sessions.'}
-    argv = [word if os.path.isabs(word) else agent, RESUME[agent]]
+    if agent == 'opencode' and session is None:
+        return {'error': 'Exact OpenCode session not found; run `opencode session list` in that folder to pick one.'}
+    # OpenCode's recorded first word is often a launcher (hc-opencode takes the model as its
+    # first argument), but a real opencode binary at an absolute path is kept.
+    if agent == 'opencode':
+        program = word if os.path.isabs(word) and os.path.basename(word) == 'opencode' else 'opencode'
+    else:
+        program = word if os.path.isabs(word) else agent
+    argv = [program, RESUME[agent]]
     if session:
         argv.append(session)
     return {'argv': argv, 'cwd': cwd, 'session': session}

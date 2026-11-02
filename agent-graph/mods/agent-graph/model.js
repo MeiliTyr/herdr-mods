@@ -11,7 +11,7 @@ export function qualify(parent, child) {
 }
 
 // Agents whose closed runs can be resumed: keep in step with ALIASES in resume.py.
-export const RESUMABLE = new Set(["claude", "claude-code", "codex", "grok", "grok-build", "cmd", "command-code"]);
+export const RESUMABLE = new Set(["claude", "claude-code", "codex", "grok", "grok-build", "cmd", "command-code", "copilot", "opencode"]);
 
 /** A record's agent word: hc's `agent`, else the basename of its command's first word. */
 export const agentOf = (rec) => rec.agent || (rec.command || "").trim().split(/\s+/)[0].split("/").pop();

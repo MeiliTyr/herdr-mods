@@ -6,7 +6,8 @@ right. Each card says what the agent is, how it stands or how it ended, and for 
 updates by itself while shown and follows the tab you switch to. A small background recorder
 keeps a history of every terminal, so agents that already finished, or were removed with `hc rm`,
 still show in the tree. Clicking a live card peeks at its terminal; clicking a finished Claude
-Code, Codex, Grok or Command Code card resumes that exact session in a new tab.
+Code, Codex, Grok, Command Code, Copilot CLI or OpenCode card resumes that exact session in a new
+tab.
 
 ![Agent graph](preview.png)
 
@@ -80,11 +81,13 @@ Top to bottom, filling its block (designed for a ~368 px side panel, works up to
   are always kept. A link to a skipped parent becomes a 24 px stub.
 - **Click** a live card: `terminal.peek`. Click a finished resumable card: `resume.py` finds
   its session and `tab.new {name, folder, argv}` runs `claude --resume <id>`,
-  `codex resume <id>`, `cmd --resume <id>` or `grok --resume <id>` in its folder. When the
-  exact session can't be found, the agent's own picker opens and a toast says so (Grok has no
-  picker: a toast explains). Other cards don't respond. Hovering a clickable card turns its
-  border `accent`.
-- **Escape** (while focused), Close, or the `close` mod command hides the layout node `panel`.
+  `codex resume <id>`, `cmd --resume <id>`, `grok --resume <id>`, `copilot --resume <id>` or
+  `opencode --session <id>` in its folder. When the exact session can't be found, the agent's own
+  picker opens and a toast says so (Grok and OpenCode have no picker flag: a toast explains).
+  Other cards don't respond. Hovering a clickable card turns its border `accent`.
+- **Escape** (while focused), Close, or the `close` mod command hides the layout node the graph
+  sits in: the recipe's `panel`, or the block's own `props.hide` when a layout gives the graph its
+  own node (e.g. its own column).
   Any other mod command (`agent-graph.<anything>`) rereads the history and redraws.
 - **Opening.** Setting shared `"agent-graph.shown"` to a new value (e.g. `Date.now()`) focuses
   the graph and brings it up to date; the opener also selects and shows its block.
@@ -102,7 +105,9 @@ Top to bottom, filling its block (designed for a ~368 px side panel, works up to
 - **Props:** `history` (optional): the history file to read; default
   `~/.local/share/herdr-agent-graph/history.json`. An absolute path is used as given, a
   relative one from the mod's folder. Point it at `fixtures/*.json` to try the view without
-  the recorder.
+  the recorder. `hide` (optional): the layout node Close/Escape hide; default `panel`. Set it when
+  the layout puts the graph somewhere else, e.g. a dedicated column:
+  `{ "mod": "agent-graph", "props": { "hide": "graph-panel" } }`.
 - **`main.js`**: the view. `herdr`: `terminals`, `spaces`, `panes`, `theme`, `run`, `props`,
   `home`, `appHome`, `readTextFile`, `watchFolder`, `knownAgents`, `nextCommand`, `shared`,
   `exec`, `notify`, `layout`. `knownAgents()` (once, at start) gives recorded cards their
@@ -124,13 +129,18 @@ Top to bottom, filling its block (designed for a ~368 px side panel, works up to
   never cross).
 - **`recorder.py`** (Python 3, standard library): follows `hc events --json`, re-reads
   `hc ls --all --json` every 15 s, and writes `history.json` atomically as described in
-  `FORMAT.md` (14 days, at most 1500 records, under 900 KB). `install.sh` installs it as a
+  `FORMAT.md` (14 days; non-current records capped at 1500; always under 900 KB). An unreadable
+  or wrong-version history is kept aside as `history.json.bad-<time>` rather than overwritten.
+  `install.sh` installs it as a
   macOS launchd agent (`dev.herdr.agent-graph-recorder`, `/usr/bin/python3 -I`, logs to
   `~/.local/share/herdr-agent-graph/recorder.log`); `uninstall.sh` removes it and keeps the
   history.
 - **`resume.py`**: given the history and a record id, finds that run's session by folder and
-  start time in `~/.claude/projects`, `~/.codex/sessions`, `~/.commandcode/projects` or
-  `~/.grok/sessions` and prints `{argv, cwd, session}` or `{error}`. Read-only.
+  start time in `~/.claude/projects`, `~/.codex/sessions`, `~/.commandcode/projects`,
+  `~/.grok/sessions`, `~/.copilot/session-state/*/workspace.yaml`, or OpenCode's
+  `~/.local/share/opencode/opencode.db` (`session` table), and prints `{argv, cwd, session}` or
+  `{error}`. Read-only (the OpenCode db is opened `mode=ro`; a live SQLite read may take a shared
+  lock).
 - **Tests:** `python3 -m unittest recorder_test resume_test` and `node live_test.mjs` (the
   coordinator against fake host data, a fake clock and controlled reads). **Fixtures:**
   `fixtures/*.json` are sample histories (a `/fusion` run, a removed parent, reused
@@ -141,12 +151,12 @@ Top to bottom, filling its block (designed for a ~368 px side panel, works up to
 
 - **What it reaches:** runs programs (`python3` for `resume.py`; the recorder runs `hc`), reads
   files outside its folder (the history under `~/.local/share/herdr-agent-graph/`, and
-  agents' session stores under `~/.claude`, `~/.codex`, `~/.commandcode`, `~/.grok` when
-  resuming). No network.
+  agents' session stores under `~/.claude`, `~/.codex`, `~/.commandcode`, `~/.grok`, `~/.copilot`
+  and OpenCode's `~/.local/share/opencode/opencode.db` when resuming). No network.
 - `install.sh` is macOS-only (launchd). On Linux run `python3 -I recorder.py` under a systemd
   user service or similar. Without the recorder the graph still shows live terminals.
-- The mod hides the node id `panel` (Close, Escape). If your layout puts the graph elsewhere,
-  change `hide()` in `main.js`.
+- The mod hides the node id `panel` (Close, Escape). If your layout puts the graph elsewhere, set
+  the block's `props.hide` to that node (or change `hideNode()` in `main.js`).
 - It needs an opener: nothing in this folder opens the panel. Add the opener above to a mod or a
   palette entry (a `keys.json` key can't set shared state and show a node at once).
 - A fresh mod copy is cold and can stall the window for seconds; keep one long-lived copy in the
@@ -170,7 +180,7 @@ Top to bottom, filling its block (designed for a ~368 px side panel, works up to
 ## Done when
 
 - `herdr-app check mods/agent-graph` passes, `python3 -m unittest recorder_test resume_test`
-  passes (20 tests), and `node live_test.mjs` passes (18 tests).
+  passes (27 tests), and `node live_test.mjs` passes (18 tests).
 - With `props: { history: "<abs path>/fixtures/review.json" }` in a space named `example-app`
   on a tab named `review`, the graph shows a `/fusion` run: `abc301-orch` (Claude Code on
   opus-5.5, `working`) as Root; in Depth 1 `abc301-critic` (Codex, `done`), `abc301-impl`
@@ -185,5 +195,6 @@ Top to bottom, filling its block (designed for a ~368 px side panel, works up to
 - With two tabs each running a sub-agent, each tab's graph shows only its own, switching tabs
   switches the graph, and a change in the other tab leaves the shown graph alone.
 - After a Claude Code sub-agent exits, clicking its card opens a new tab running
-  `claude --resume <its session>` in its folder.
+  `claude --resume <its session>` in its folder; the same works for Codex, Command Code, Grok,
+  Copilot CLI and OpenCode.
 - Scroll pans smoothly on a big graph; Center and Reset move the view; Escape hides the panel.

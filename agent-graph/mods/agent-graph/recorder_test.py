@@ -5,6 +5,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RECORDER = os.path.join(HERE, "recorder.py")
@@ -199,10 +200,55 @@ class RecorderTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "history.json")
             with open(path, "w") as f:
-                f.write("{")
+                json.dump({"version": 2, "records": []}, f)
             rec = recorder.Recorder()
             rec.load(path)
-        self.assertEqual(rec.records, {})
+            self.assertEqual(rec.records, {})
+            self.assertEqual(len([n for n in os.listdir(tmp) if n.startswith("history.json.bad-")]), 1)
+
+    def test_13_loading_preserves_unreadable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "history.json")
+            with open(path, "w") as f:
+                f.write("{ not json")
+            rec = recorder.Recorder()
+            rec.load(path)
+            self.assertEqual(rec.records, {})
+            aside = [n for n in os.listdir(tmp) if n.startswith("history.json.bad-")]
+            self.assertEqual(len(aside), 1)
+            with open(os.path.join(tmp, aside[0])) as f:
+                self.assertEqual(f.read(), "{ not json")
+
+    def test_13_preserve_names_unique(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "history.json")
+            for _ in range(3):
+                with open(path, "w") as f:
+                    f.write("{")
+                recorder.Recorder().load(path)
+            aside = [n for n in os.listdir(tmp) if n.startswith("history.json.bad-")]
+            self.assertEqual(len(aside), 3)
+
+    def test_13_preserve_failure_aborts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "history.json")
+            with open(path, "w") as f:
+                f.write("{ not json")
+            with mock.patch("os.replace", side_effect=OSError("boom")):
+                with self.assertRaises(OSError):
+                    recorder.Recorder().load(path)
+            with open(path) as f:
+                self.assertEqual(f.read(), "{ not json")
+
+    def test_11b_size_cap_current_only(self):
+        for i in range(2000):
+            feed(self.rec, event("created", f"t{i}", term(f"t{i}", NOW - 200000 + i,
+                                                         cwd="/" + "c" * 400, argv=["a" * 250],
+                                                         name="n" * 200, labels={"where": "w" * 300})))
+        d = self.snap()
+        data = json.dumps(d, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self.assertLess(len(data), 900000)
+        self.assertGreater(len(d["records"]), 0)
 
 
 class ProcessTest(unittest.TestCase):

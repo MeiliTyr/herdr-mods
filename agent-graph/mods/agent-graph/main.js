@@ -39,7 +39,10 @@ function onScreen(node, id) {
 
 // Outside a layout block named "graph" (a pane, a check run) it always shows.
 const isShown = () => onScreen(windowLayout(), "graph") ?? true;
-const hide = () => run("layout.hide", { id: "panel" });
+// Close/Escape hide the layout node the graph sits in: the recipe's "panel", or the block's own
+// props.hide when a layout gives the graph its own node (e.g. its own column).
+const hideNode = () => props()?.hide ?? "panel";
+const hide = () => run("layout.hide", { id: hideNode() });
 
 // The history file: props().history (absolute as given, relative to this mod's folder), else the
 // recorder's.
