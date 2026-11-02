@@ -100,8 +100,30 @@ Top to bottom, filling its block (designed for a ~368 px side panel, works up to
   The mod renders nothing while node `graph` is off screen (it or an ancestor hidden, or a
   stack showing another child); with no node `graph` in the layout (a pane, a check run) it
   always draws. `mod.json`: `{ "place": "none", "title": "Agent graph" }`.
-- **Opener** (in another mod: a tab-bar button, a palette entry):
+- **Opener.** Nothing here opens the panel; add one to another mod or a palette entry. The minimal
+  form, when the graph is a stack child, sets the focus token and reveals it:
   `setShared("agent-graph.shown", Date.now()); run("layout.select", { stack: "panel-body", child: "graph" }); run("layout.show", { id: "panel" });`
+  A tab-bar button that gives the graph its own column (the author's setup):
+  1. Clone the shipped `tabs` mod — `herdr-app do mod.clone '{"name":"tabs","as":"tabs-graph"}'` —
+     and point the layout's tab-bar block at it (its `content.mod` becomes `"tabs-graph"`).
+  2. In a clone of `main`, add a hidden column `graph-panel` (368 px, min 280, max 900) as a child
+     of `work-body` (a sibling of `main` and the built-in `panel`) holding
+     `{ "id": "graph", "type": "block", "content": { "mod": "agent-graph", "props": { "hide": "graph-panel" } } }`.
+  3. Give `tabs-graph` a button (rendered only while a `graph-panel` node exists) and one method
+     that both it and the key call:
+     ```js
+     toggleGraph() {
+       const panel = find(layout(), "graph-panel");
+       if (!panel) return;
+       if (panel.hidden) { setShared("agent-graph.shown", Date.now()); run("layout.show", { id: "graph-panel" }); }
+       else run("layout.hide", { id: "graph-panel" });
+     }
+     ```
+     plus a `nextCommand` loop in `init`: `for (;;) { const c = await nextCommand(); if (c === "toggleGraph") this.toggleGraph(); }`.
+  4. Bind the key where the node exists, so it isn't taken in every layout — `keys.json`
+     `"layout:main-graph": { "cmd-shift-g": "tabs-graph.toggleGraph" }`. One `keys.json` value is a
+     single command, so the chained open lives in the always-shown tab bar's `nextCommand`;
+     `layout.toggle:graph-panel` alone can reveal the wrong stack child and never focuses the graph.
 - **Props:** `history` (optional): the history file to read; default
   `~/.local/share/herdr-agent-graph/history.json`. An absolute path is used as given, a
   relative one from the mod's folder. Point it at `fixtures/*.json` to try the view without
@@ -157,8 +179,10 @@ Top to bottom, filling its block (designed for a ~368 px side panel, works up to
   user service or similar. Without the recorder the graph still shows live terminals.
 - The mod hides the node id `panel` (Close, Escape). If your layout puts the graph elsewhere, set
   the block's `props.hide` to that node (or change `hideNode()` in `main.js`).
-- It needs an opener: nothing in this folder opens the panel. Add the opener above to a mod or a
-  palette entry (a `keys.json` key can't set shared state and show a node at once).
+- It needs an opener: nothing in this folder opens the panel. Add one to a mod or a palette entry —
+  see the tab-bar button in Built from. A `keys.json` key alone can't set shared state and show a
+  node at once, so the chained open belongs in an always-shown mod's `nextCommand`, and any key
+  should be scoped to the layout that has the node (`layout:<name>`).
 - A fresh mod copy is cold and can stall the window for seconds; keep one long-lived copy in the
   layout (a hidden stack child) rather than opening it as an overlay each time.
 - Herdr calls `render()` on every live-data change, title ticks included, and there is no
