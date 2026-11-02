@@ -90,7 +90,21 @@ Top to bottom, filling its block (designed for a ~368 px side panel, works up to
   own node (e.g. its own column).
   Any other mod command (`agent-graph.<anything>`) rereads the history and redraws.
 - **Opening.** Setting shared `"agent-graph.shown"` to a new value (e.g. `Date.now()`) focuses
-  the graph and brings it up to date; the opener also selects and shows its block.
+  the graph and brings it up to date; the opener also selects and shows its block. Escape only
+  works while the graph holds the keyboard: it takes it when opened this way, and loses it to a
+  click elsewhere (`mod.json` isn't `focusable`, so `pane.go` doesn't reach it).
+- **The opener (author's setup).** The graph is a third choice in the right side panel, beside
+  Files and Changes; one shows at a time. The tab bar has an **Agent graph** chip (graph icon,
+  right of `+`, before Files) styled like Files and Changes: `selected` background and
+  `foreground` text while the panel shows the graph, else `chrome`/`muted`. Clicking it, or
+  `cmd-shift-g`, opens the panel on the graph, focused; with the panel already on Files or
+  Changes it switches to the graph. Clicking it, or `cmd-shift-g`, while the graph shows closes
+  the panel. The panel's choice is remembered per space, graph included: switching spaces
+  restores what that space last had open. The command palette (`cmd-shift-p`) lists
+  **Agent graph: open** while the graph is closed and **Agent graph: close** while it shows.
+- **Resuming** opens a tab named after the card's title. Errors from `resume.py` or `python3`
+  show as a `Cannot resume session` toast; an inexact match opens the agent's picker and says
+  `Session not found`.
 
 ## Built from
 
@@ -100,30 +114,56 @@ Top to bottom, filling its block (designed for a ~368 px side panel, works up to
   The mod renders nothing while node `graph` is off screen (it or an ancestor hidden, or a
   stack showing another child); with no node `graph` in the layout (a pane, a check run) it
   always draws. `mod.json`: `{ "place": "none", "title": "Agent graph" }`.
-- **Opener.** Nothing here opens the panel; add one to another mod or a palette entry. The minimal
-  form, when the graph is a stack child, sets the focus token and reveals it:
+- **Opener.** Nothing in `mods/agent-graph/` opens the panel: an `agent-graph.<command>` only
+  reaches shown copies, and the graph isn't shown while its panel is hidden. The minimal open,
+  from any always-shown mod, sets the focus token and reveals the stack child:
   `setShared("agent-graph.shown", Date.now()); run("layout.select", { stack: "panel-body", child: "graph" }); run("layout.show", { id: "panel" });`
-  A tab-bar button that gives the graph its own column (the author's setup):
-  1. Clone the shipped `tabs` mod — `herdr-app do mod.clone '{"name":"tabs","as":"tabs-graph"}'` —
-     and point the layout's tab-bar block at it (its `content.mod` becomes `"tabs-graph"`).
-  2. In a clone of `main`, add a hidden column `graph-panel` (368 px, min 280, max 900) as a child
-     of `work-body` (a sibling of `main` and the built-in `panel`) holding
-     `{ "id": "graph", "type": "block", "content": { "mod": "agent-graph", "props": { "hide": "graph-panel" } } }`.
-  3. Give `tabs-graph` a button (rendered only while a `graph-panel` node exists) and one method
-     that both it and the key call:
-     ```js
-     toggleGraph() {
-       const panel = find(layout(), "graph-panel");
-       if (!panel) return;
-       if (panel.hidden) { setShared("agent-graph.shown", Date.now()); run("layout.show", { id: "graph-panel" }); }
-       else run("layout.hide", { id: "graph-panel" });
-     }
-     ```
-     plus a `nextCommand` loop in `init`: `for (;;) { const c = await nextCommand(); if (c === "toggleGraph") this.toggleGraph(); }`.
-  4. Bind the key where the node exists, so it isn't taken in every layout — `keys.json`
-     `"layout:main-graph": { "cmd-shift-g": "tabs-graph.toggleGraph" }`. One `keys.json` value is a
-     single command, so the chained open lives in the always-shown tab bar's `nextCommand`;
-     `layout.toggle:graph-panel` alone can reveal the wrong stack child and never focuses the graph.
+  The author's setup (behaviour under How it behaves):
+  1. **Layout** `main-graph`: `herdr-app do layout.clone '{"name":"main","as":"main-graph"}'`,
+     then add `{ "id": "graph", "type": "block", "content": { "mod": "agent-graph" } }` as the
+     last child of the `panel-body` stack and set the tab-bar block's (`"id": "tabs"`)
+     `content.mod` to `"tabs-graph"`. The panel keeps the shipped `panel` column (hidden, 368 px,
+     min 280, max 900), so Close/Escape need no `props.hide`.
+  2. **Tab bar** `tabs-graph`: `herdr-app do mod.clone '{"name":"tabs","as":"tabs-graph"}'` (the
+     clone rewrites its own `mods/tabs/` icon paths), then:
+     - import `setShared` and `nextCommand` from `"herdr"`;
+     - `init(_props, cx)` starts
+       `cx.spawn(async () => { for (;;) { const c = await nextCommand(); if (c === "toggleGraph") this.toggleGraph(); } });`
+     - add the method the key calls (the chip keeps using `panelButton`):
+       ```js
+       toggleGraph() {
+         const root = layout(), panel = find(root, "panel"), body = find(root, "panel-body");
+         if (!panel || !find(root, "graph")) return;
+         if (!panel.hidden && body?.active === "graph") { run("layout.hide", { id: "panel" }); return; }
+         setShared("agent-graph.shown", Date.now());
+         run("layout.select", { stack: "panel-body", child: "graph" });
+         run("layout.show", { id: "panel" });
+       }
+       ```
+     - in `render`, make the graph a panel choice so the per-space memory keeps it:
+       `const hasGraph = Boolean(find(root, "graph")); this.syncPanel(space, panel, body, hasGraph ? [...enabled, "graph"] : enabled);`
+     - give `panelButton(id, label, icon, before)` a `before` hook, called just before its
+       `layout.select`, and add, after the `+` button and before Files:
+       `.when(hasGraph, el => el.child(panelButton("graph", "Agent graph", "mods/agent-graph/icons/graph.svg", () => setShared("agent-graph.shown", Date.now()))))`
+  3. **Key**: this folder's `keys.json`,
+     `"layout:main-graph": { "cmd-shift-g": "tabs-graph.toggleGraph" }`. Scoped to the layout
+     that has the node, so the key stays free elsewhere. One `keys.json` value is a single
+     command, so the chained open lives in the always-shown tab bar's `nextCommand`;
+     `layout.toggle:panel` alone can reveal the wrong stack child and never focuses the graph.
+  4. **Palette entries** (optional). Herdr's palette (`frame/palette`) is rewritten on every
+     start and can't be extended, so the author runs a copy:
+     - copy `frame/palette/` to `mods/command-palette/` (its icon path becomes
+       `mods/command-palette/command.svg`); give its `NAMED` rows an optional sixth element, an
+       action function, kept by the row filter (`action || known.has(name)`) and the row map, and
+       on Enter run `e.action()` instead of `run(name, args)` when it has one;
+     - add `["agent-graph.open", {}, "App", "Agent graph: open", "show panel spawn tree agents", <the minimal open above>]`
+       and `["agent-graph.close", {}, "App", "Agent graph: close", "hide panel spawn tree agents", () => run("layout.hide", { id: "panel" })]`,
+       filtered so only one shows: open while `graph` exists and isn't the shown stack child of
+       a visible `panel`, close while it is;
+     - open the copy from a clone of `workspace-status` (`status-bar`, the layout's `status`
+       block): its click and a `nextCommand` loop call
+       `openOverlay({ mod: "command-palette", kind: "dialog", width: 640, height: 440 })`, with
+       `"global": { "cmd-shift-p": "status-bar.palette" }` in `keys.json`.
 - **Props:** `history` (optional): the history file to read; default
   `~/.local/share/herdr-agent-graph/history.json`. An absolute path is used as given, a
   relative one from the mod's folder. Point it at `fixtures/*.json` to try the view without
@@ -164,10 +204,12 @@ Top to bottom, filling its block (designed for a ~368 px side panel, works up to
   `{error}`. Read-only (the OpenCode db is opened `mode=ro`; a live SQLite read may take a shared
   lock).
 - **Tests:** `python3 -m unittest recorder_test resume_test` and `node live_test.mjs` (the
-  coordinator against fake host data, a fake clock and controlled reads). **Fixtures:**
-  `fixtures/*.json` are sample histories (a `/fusion` run, a removed parent, reused
-  addresses, idle agents, a 28-card overflow).
-- **Art:** `icons/crosshair.svg`, `icons/undo.svg` (24×24 stroke icons, tinted).
+  coordinator against fake host data, a fake clock and controlled reads), both run from the mod's
+  folder. **Fixtures:** `fixtures/*.json` are sample histories (a `/fusion` run, a removed
+  parent, reused addresses, idle agents, a 28-card overflow).
+- **Art:** `icons/crosshair.svg`, `icons/undo.svg` (the bar's buttons) and `icons/graph.svg`
+  (the opener's chip: three nodes, two links down to one), 24×24 stroke icons, tinted.
+- **`keys.json`** (beside `mods/`): the opener's `cmd-shift-g`, to merge into the person's.
 
 ## Watch out
 
@@ -179,10 +221,23 @@ Top to bottom, filling its block (designed for a ~368 px side panel, works up to
   user service or similar. Without the recorder the graph still shows live terminals.
 - The mod hides the node id `panel` (Close, Escape). If your layout puts the graph elsewhere, set
   the block's `props.hide` to that node (or change `hideNode()` in `main.js`).
-- It needs an opener: nothing in this folder opens the panel. Add one to a mod or a palette entry —
-  see the tab-bar button in Built from. A `keys.json` key alone can't set shared state and show a
-  node at once, so the chained open belongs in an always-shown mod's `nextCommand`, and any key
-  should be scoped to the layout that has the node (`layout:<name>`).
+- It needs an opener: nothing in `mods/agent-graph/` opens the panel. Add one to a mod or a
+  palette entry — see the tab-bar opener in Built from. A `keys.json` key alone can't set shared
+  state and show a node at once, so the chained open belongs in an always-shown mod's
+  `nextCommand`, and any key should be scoped to the layout that has the node (`layout:<name>`).
+  The shipped `keys.json` targets `tabs-graph` in `main-graph`: without those two, its key does
+  nothing; with other names, change it to match.
+- Giving the graph its own column instead of a stack child (with `props.hide`) works, but then
+  it opens as a second panel beside Files/Changes rather than in their place; the author chose
+  the stack.
+- The folder name is load-bearing: `main.js` runs `${appHome()}/mods/agent-graph/resume.py`, and
+  the opener's chip uses `mods/agent-graph/icons/graph.svg`. Renamed (a name clash), change both.
+- Updating `recorder.py` doesn't reach the running recorder: restart it with
+  `launchctl kickstart -k gui/$(id -u)/dev.herdr.agent-graph-recorder` (or rerun `install.sh`).
+  A history it can't read is set aside as `history.json.bad-<time>`; if even that fails the
+  recorder refuses to start, so check `recorder.log` when the history stops growing.
+- `python3 -I -m unittest ...` fails to import the modules (`-I` drops the current folder from
+  the path); run the tests without `-I`, from the mod's folder.
 - A fresh mod copy is cold and can stall the window for seconds; keep one long-lived copy in the
   layout (a hidden stack child) rather than opening it as an overlay each time.
 - Herdr calls `render()` on every live-data change, title ticks included, and there is no
@@ -222,3 +277,9 @@ Top to bottom, filling its block (designed for a ~368 px side panel, works up to
   `claude --resume <its session>` in its folder; the same works for Codex, Command Code, Grok,
   Copilot CLI and OpenCode.
 - Scroll pans smoothly on a big graph; Center and Reset move the view; Escape hides the panel.
+- In `main-graph`, `cmd-shift-g` (or the Agent graph chip) opens the side panel on the graph with
+  the chip highlighted and Escape working at once; with Files showing, it switches the same panel
+  to the graph; pressing it again closes the panel. No second column appears.
+- Opening the graph in one space and Files in another, then switching between them, restores
+  each space's choice.
+- The palette shows `Agent graph: open` while it's closed and `Agent graph: close` while it shows.

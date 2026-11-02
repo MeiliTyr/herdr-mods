@@ -1,0 +1,5 @@
+{
+  "layout:main-graph": {
+    "cmd-shift-g": "tabs-graph.toggleGraph"
+  }
+}
