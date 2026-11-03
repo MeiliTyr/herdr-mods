@@ -1,18 +1,7 @@
-<svg
-  xmlns="http://www.w3.org/2000/svg"
-  width="24"
-  height="24"
-  viewBox="0 0 24 24"
-  fill="none"
-  stroke="currentColor"
-  stroke-width="2"
-  stroke-linecap="round"
-  stroke-linejoin="round"
->
-  <circle cx="6" cy="6" r="2.5" />
-  <circle cx="18" cy="6" r="2.5" />
-  <circle cx="12" cy="18" r="2.5" />
-  <path d="M8.5 6h7" />
-  <path d="M7.4 8.3 10.6 15.7" />
-  <path d="M16.6 8.3 13.4 15.7" />
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <circle cx="5.5" cy="12" r="2.5" />
+  <circle cx="18.5" cy="6.5" r="2.5" />
+  <circle cx="18.5" cy="17.5" r="2.5" />
+  <path d="M8 12h3v-5.5h5" />
+  <path d="M11 12v5.5h5" />
 </svg>

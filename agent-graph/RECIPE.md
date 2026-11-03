@@ -208,7 +208,8 @@ Top to bottom, filling its block (designed for a ~368 px side panel, works up to
   folder. **Fixtures:** `fixtures/*.json` are sample histories (a `/fusion` run, a removed
   parent, reused addresses, idle agents, a 28-card overflow).
 - **Art:** `icons/crosshair.svg`, `icons/undo.svg` (the bar's buttons) and `icons/graph.svg`
-  (the opener's chip: three nodes, two links down to one), 24×24 stroke icons, tinted.
+  (the opener's chip: one node on the left branching to two on the right), 24×24 stroke icons,
+  tinted.
 - **`keys.json`** (beside `mods/`): the opener's `cmd-shift-g`, to merge into the person's.
 
 ## Watch out
