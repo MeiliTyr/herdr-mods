@@ -22,7 +22,7 @@
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { terminals, spaces, panes, theme, run, props, home, readTextFile, watchFolder, knownAgents, nextCommand, shared, exec, notify, appHome, layout as windowLayout } from "herdr";
-import { parseHistory, merge, orderRuns, facts, title, outcome, isDone, duration, layout, colX, rowY, CARD_W, CARD_H, qualify, RESUMABLE, agentOf, reported } from "./model.js";
+import { parseHistory, merge, orderRuns, facts, title, outcome, isDone, duration, layout, colX, rowY, CARD_W, CARD_H, qualify, RESUMABLE, agentOf, reported, isSub } from "./model.js";
 import { Live } from "./live.js";
 
 // Whether layout node `id` is on screen: it and every ancestor not hidden, and every stack on the
@@ -219,18 +219,20 @@ function describe(n, worked) {
   // The program first, then what it runs (a model, a test filter) and why it may be quiet.
   const program = n.live?.program?.name ?? n.rec?.agent ?? null;
   const command = n.rec?.command || n.live?.argv?.join(" ") || n.live?.program?.name || n.rec?.agent;
-  // A reported sub-agent has no terminal and no session of its own: a click peeks its parent's.
-  const sub = Boolean(n.live?.sub);
+  // A reported sub-agent has no terminal and no session of its own: a click peeks its parent's,
+  // and a finished one isn't resumable (its agent word would resume the parent's session).
+  const sub = isSub(n);
+  const parent = n.live?.parent ?? n.rec?.parent;
   const resumable = !sub && Boolean(n.rec && n.live?.state !== "live" && RESUMABLE.has(agentOf(n.rec)));
   return {
     f,
     o,
     title: name,
     meta: sub
-      ? [n.live.parent, "sub-agent", n.live.msg].filter(Boolean).join(" · ")
+      ? [parent, "sub-agent", n.live?.msg].filter(Boolean).join(" · ")
       : [n.address, program, f.removed != null ? "removed" : null, f.notSeen ? "not seen" : null,
         command && command !== program ? command : null].filter(Boolean).join(" · "),
-    peek: sub ? n.live.parent : n.address,
+    peek: sub ? parent : n.address,
     program: n.live?.program ?? recordedProgram(n.rec),
     letter: (n.rec?.agent || name || "?").replace(/[^\p{L}\p{N}]/gu, "").charAt(0).toUpperCase() || "?",
     done: isDone(n, f, o, worked),

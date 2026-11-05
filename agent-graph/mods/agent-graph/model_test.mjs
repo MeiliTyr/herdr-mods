@@ -1,10 +1,33 @@
-// The pure model (model.js): reported sub-agents and how they join the graph.
+// The pure model (model.js): reported sub-agents and how they join the graph, live and recorded.
 // Run: node model_test.mjs
 
 import assert from "node:assert/strict";
-import { reported, merge, facts, layout } from "./model.js";
+import { reported, merge, facts, layout, outcome, isSub } from "./model.js";
 
 const CLAUDE = { name: "Claude Code", icon: "icons/claude.svg", tint: false, agent: true };
+
+// A history record as the recorder writes it (FORMAT.md).
+function rec(address, created_ms, extra = {}) {
+  return {
+    id: `${address}@${created_ms}`,
+    address,
+    parent: null,
+    parent_id: null,
+    name: null,
+    agent: "claude-code",
+    command: null,
+    cwd: "/work",
+    where: "space / tab",
+    state: "live",
+    status: "working",
+    created_ms,
+    finished_ms: null,
+    exit_code: null,
+    reason: null,
+    removed_ms: null,
+    ...extra,
+  };
+}
 
 // A live terminal as main.js's liveTerminals() gives it.
 function term(address, extra = {}) {
@@ -121,6 +144,54 @@ const tests = {
     assert.equal(f.created, 5000);
     assert.equal(f.state, "live");
     assert.equal(f.status, "working");
+  },
+
+  "a running sub-agent joins its recorded record instead of showing twice"() {
+    const records = [
+      rec("t1", 1000, { command: "claude" }),
+      rec("t1#a1", 4000, { parent: "t1", parent_id: "t1@1000", name: "Find the parser" }),
+    ];
+    const t1 = term("t1");
+    // This copy of the graph saw it later than the recorder did.
+    const { children } = reported([{ term: t1, records: { a1: { state: "blocked", title: "Find the parser" } } }], new Map(), 9000);
+    const run = merge(records, [t1, ...children])[0];
+    assert.deepEqual(run.nodes.map((n) => n.address), ["t1", "t1#a1"]);
+    const kid = run.root.kids[0];
+    assert.ok(kid.rec && kid.live);
+    assert.equal(isSub(kid), true);
+    const f = facts(kid);
+    // The live status wins; the start is the recorder's, the same in every copy of the graph.
+    assert.equal(f.status, "blocked");
+    assert.equal(f.created, 4000);
+  },
+
+  "a finished sub-agent stays under its agent as ended"() {
+    const records = [
+      rec("t1", 1000, { command: "claude" }),
+      rec("t1#a1", 4000, { parent: "t1", parent_id: "t1@1000", name: "Find the parser", state: "finished", finished_ms: 9000 }),
+    ];
+    const run = merge(records, [term("t1")])[0];
+    const kid = run.root.kids[0];
+    assert.equal(kid.address, "t1#a1");
+    assert.equal(kid.live, null);
+    assert.equal(isSub(kid), true);
+    assert.equal(isSub(run.root), false);
+    assert.deepEqual(outcome(kid), { word: "ended", kind: "ended" });
+    assert.equal(facts(kid).finished, 9000);
+  },
+
+  "only an address under its own parent is a recorded sub-agent"() {
+    assert.equal(isSub({ rec: rec("box/t7#a1", 1, { parent: "box/t7" }), live: null }), true);
+    assert.equal(isSub({ rec: rec("t2", 1, { parent: "t1" }), live: null }), false);
+    assert.equal(isSub({ rec: rec("t10#a1", 1, { parent: "t1" }), live: null }), false);
+    assert.equal(isSub({ rec: rec("t1#a1", 1), live: null }), false);
+  },
+
+  "the sub-agent address matches recorder.py's byte for byte"() {
+    // The recorder writes the same address with quote(); the view matches its record by it.
+    // recorder_test.py pins the same string.
+    const { children } = reported([{ term: term("box/t7"), records: { "x/y z#é!'()*~-_.": { state: "working" } } }], new Map(), 1);
+    assert.equal(children[0].address, "box/t7#x%2Fy%20z%23%C3%A9!'()*~-_.");
   },
 };
 

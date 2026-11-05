@@ -59,6 +59,10 @@ export function reported(list, seen, now) {
   return { children, seen: next };
 }
 
+/** Whether a node is a reported sub-agent: a live one from reported(), or a recorded one (the
+ *  recorder writes its address as its terminal's, `#`, then the id). */
+export const isSub = (n) => Boolean(n.live?.sub) || Boolean(n.rec?.parent && n.rec.address.startsWith(`${n.rec.parent}#`));
+
 export function parseHistory(text) {
   const data = JSON.parse(text);
   if (!data || !Array.isArray(data.records)) throw new Error("no records list");
